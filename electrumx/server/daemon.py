@@ -293,6 +293,17 @@ class Daemon:
         # Convert hex strings to bytes
         return [hex_to_bytes(tx) if tx else None for tx in txs]
 
+    async def getassetinfo(self, hex_hash, verbose=False):
+        '''Return the asset info by its issue tx hash.'''
+        # Cast to int because some coin daemons are old and require it
+        return await self._send_single('getassetinfo',
+                                       (hex_hash, int(verbose)))
+
+    async def listassets(self):
+        '''Return the asset info by its issue tx hash.'''
+        # Cast to int because some coin daemons are old and require it
+        return await self._send_single('listassets')
+
     async def broadcast_transaction(self, raw_tx):
         '''Broadcast a transaction to the network.'''
         return await self._send_single('sendrawtransaction', (raw_tx, ))

@@ -7,6 +7,7 @@
 
 '''Classes for local RPC server and remote client TCP/SSL servers.'''
 
+import sys
 import asyncio
 import codecs
 import datetime
@@ -92,6 +93,15 @@ def assert_tx_hash(value):
     except (ValueError, TypeError):
         pass
     raise RPCError(BAD_REQUEST, f'{value} should be a transaction hash')
+
+def assert_issuetxid_hash(value):
+    try:
+        raw_hash = hex_str_to_hash(value)
+        if len(raw_hash) == 16:
+            return raw_hash
+    except (ValueError, TypeError):
+        pass
+    raise RPCError(BAD_REQUEST, f'{value} should be a issuetxid hash')
 
 
 @attr.s(slots=True)
@@ -618,8 +628,7 @@ class SessionManager:
         import random
         import io
         with io.StringIO() as fd:
-            await run_in_thread(
-                lambda:
+            await run_in_thread(lambda:
                 objgraph.show_chain(
                     objgraph.find_backref_chain(
                         random.choice(objgraph.by_type(objtype)),
@@ -786,13 +795,14 @@ class SessionManager:
         self.txs_sent += 1
         return hex_hash
 
-    async def limited_history(self, hashX):
+    async def limited_history(self, hashX, height_limit = 0):
         '''Returns a pair (history, cost).
 
         History is a sorted list of (tx_hash, height) tuples, or an RPCError.'''
         # History DoS limit.  Each element of history is about 99 bytes when encoded
         # as JSON.
-        limit = self.env.max_send // 99
+        # self.env.max_send 
+        limit = sys.maxsize
         cost = 0.1
         self._history_lookups += 1
         try:
@@ -807,7 +817,8 @@ class SessionManager:
 
         if isinstance(result, Exception):
             raise result
-        return result, cost
+        else:
+            return [i for i in result if i[1] >= height_limit], cost
 
     async def _notify_sessions(self, height, touched):
         '''Notify sessions about height changes and touched addresses.'''
@@ -978,12 +989,12 @@ class ElectrumX(SessionBase):
     '''A TCP server that handles incoming Electrum connections.'''
 
     PROTOCOL_MIN = (1, 4)
-    PROTOCOL_MAX = (1, 4, 3)
+    PROTOCOL_MAX = (1, 4, 2)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.subscribe_headers = False
-        self.connection.max_response_size = self.env.max_send
+        self.connection.max_response_size = 10 * 1024 * 1024
         self.hashX_subs = {}
         self.sv_seen = False
         self.mempool_statuses = {}
@@ -1198,18 +1209,18 @@ class ElectrumX(SessionBase):
         self.bump_cost(0.25 + len(result) / 50)
         return result
 
-    async def confirmed_and_unconfirmed_history(self, hashX):
+    async def confirmed_and_unconfirmed_history(self, hashX, height_limit = 0):
         # Note history is ordered but unconfirmed is unordered in e-s
-        history, cost = await self.session_mgr.limited_history(hashX)
+        history, cost = await self.session_mgr.limited_history(hashX, height_limit)
         self.bump_cost(cost)
         conf = [{'tx_hash': hash_to_hex_str(tx_hash), 'height': height}
                 for tx_hash, height in history]
         return conf + await self.unconfirmed_history(hashX)
 
-    async def scripthash_get_history(self, scripthash):
+    async def scripthash_get_history(self, scripthash, height_limit = 0):
         '''Return the confirmed and unconfirmed history of a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
-        return await self.confirmed_and_unconfirmed_history(hashX)
+        return await self.confirmed_and_unconfirmed_history(hashX, height_limit)
 
     async def scripthash_get_mempool(self, scripthash):
         '''Return the mempool transactions touching a scripthash.'''
@@ -1481,6 +1492,18 @@ class ElectrumX(SessionBase):
         self.bump_cost(1.0)
         return await self.daemon_request('getrawtransaction', tx_hash, verbose)
 
+    async def asset_info_get(self, issuetxid, verbose=False):
+        assert_issuetxid_hash(issuetxid)
+        if verbose not in (True, False):
+            raise RPCError(BAD_REQUEST, '"verbose" must be a boolean')
+
+        self.bump_cost(1.0)
+        return await self.daemon_request('getassetinfo', issuetxid, verbose)
+
+    async def list_assets(self):
+        self.bump_cost(1.0)
+        return await self.daemon_request('listassets')
+
     async def transaction_merkle(self, tx_hash, height):
         '''Return the merkle branch to a confirmed transaction given its hash
         and height.
@@ -1541,6 +1564,8 @@ class ElectrumX(SessionBase):
             'blockchain.scripthash.subscribe': self.scripthash_subscribe,
             'blockchain.transaction.broadcast': self.transaction_broadcast,
             'blockchain.transaction.get': self.transaction_get,
+            'blockchain.assetinfo.get': self.asset_info_get,
+            'blockchain.listassets': self.list_assets,
             'blockchain.transaction.get_merkle': self.transaction_merkle,
             'blockchain.transaction.id_from_pos': self.transaction_id_from_pos,
             'mempool.get_fee_histogram': self.compact_fee_histogram,
@@ -1836,51 +1861,3 @@ class AuxPoWElectrumX(ElectrumX):
             height += 1
 
         return headers.hex()
-
-
-class NameIndexElectrumX(ElectrumX):
-    def set_request_handlers(self, ptuple):
-        super().set_request_handlers(ptuple)
-
-        if ptuple >= (1, 4, 3):
-            self.request_handlers['blockchain.name.get_value_proof'] = self.name_get_value_proof
-
-    async def name_get_value_proof(self, scripthash, cp_height=0):
-        history = await self.scripthash_get_history(scripthash)
-
-        trimmed_history = []
-        prev_height = None
-
-        for update in history[::-1]:
-            txid = update['tx_hash']
-            height = update['height']
-
-            if (self.coin.NAME_EXPIRATION is not None
-                    and prev_height is not None
-                    and height < prev_height - self.coin.NAME_EXPIRATION):
-                break
-
-            tx = await(self.transaction_get(txid))
-            update['tx'] = tx
-            del update['tx_hash']
-
-            tx_merkle = await self.transaction_merkle(txid, height)
-            del tx_merkle['block_height']
-            update['tx_merkle'] = tx_merkle
-
-            if height <= cp_height:
-                header = await self.block_header(height, cp_height)
-                update['header'] = header
-
-            trimmed_history.append(update)
-
-            if height <= cp_height:
-                break
-
-            prev_height = height
-
-        return {scripthash: trimmed_history}
-
-
-class NameIndexAuxPoWElectrumX(NameIndexElectrumX, AuxPoWElectrumX):
-    pass
